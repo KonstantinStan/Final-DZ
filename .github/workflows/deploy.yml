@@ -34,9 +34,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Compute Tag
+      - name: Compute Tag and Lowercase Repo
         id: meta
         run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=${REPO_LOWER}" >> $GITHUB_OUTPUT
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
           else
@@ -47,7 +49,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.tag }}
+          tags: ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.tag }}
 
   deploy:
     needs: build-and-publish
