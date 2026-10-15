@@ -1,0 +1,11 @@
+db:
+  host: postgres
+  port: 5432
+  user: audit_svc
+  password: "{{ vault_audit_svc_password }}"
+  database: audit
+  pool_min_size: 2
+  pool_max_size: 10
+server:
+  host: 0.0.0.0
+  port: 8080

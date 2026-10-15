@@ -1,0 +1,150 @@
+- name: Deploy audit-svc infrastructure
+  hosts: localhost
+  become: true
+  tasks:
+    - name: Create docker network
+      community.docker.docker_network:
+        name: "{{ app_network }}"
+        state: present
+
+    - name: Ensure app directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ app_data_dir }}"
+        - "{{ app_data_dir }}/nginx"
+
+    - name: Run PostgreSQL container
+      community.docker.docker_container:
+        name: postgres
+        image: postgres:17
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ app_network }}"
+        env:
+          POSTGRES_PASSWORD: "{{ vault_postgres_password }}"
+        volumes:
+          - postgres_data:/var/lib/postgresql/data
+        ports:
+          - "127.0.0.1:5432:5432"
+
+    - name: Wait for PostgreSQL to be ready
+      community.docker.docker_container_exec:
+        container: postgres
+        command: pg_isready -U postgres
+      register: pg_ready
+      until: pg_ready.rc == 0
+      retries: 20
+      delay: 2
+
+    - name: Create audit_svc DB user
+      community.docker.docker_container_exec:
+        container: postgres
+        command: >
+          psql -U postgres -c "DO \$\$
+          BEGIN
+            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'audit_svc') THEN
+              CREATE ROLE audit_svc LOGIN PASSWORD '{{ vault_audit_svc_password }}';
+            ELSE
+              ALTER ROLE audit_svc WITH PASSWORD '{{ vault_audit_svc_password }}';
+            END IF;
+          END
+          \$\$;"
+      register: db_user_out
+      changed_when: "'ALTER ROLE' in db_user_out.stdout or 'CREATE ROLE' in db_user_out.stdout"
+
+    - name: Create audit database
+      community.docker.docker_container_exec:
+        container: postgres
+        command: >
+          psql -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'audit'"
+      register: db_exists
+      changed_when: false
+
+    - name: Provision audit database with owner
+      community.docker.docker_container_exec:
+        container: postgres
+        command: psql -U postgres -c "CREATE DATABASE audit OWNER audit_svc;"
+      when: db_exists.stdout | trim != "1"
+
+    - name: Render audit-svc config.yaml
+      ansible.builtin.template:
+        src: templates/config.yaml.j2
+        dest: "{{ app_data_dir }}/config.yaml"
+        mode: '0644'
+      notify: Reload audit-svc
+
+    - name: Run database migrations
+      community.docker.docker_container:
+        name: audit-svc-migrate
+        image: "{{ app_image }}"
+        command: migrate
+        state: started
+        detach: false
+        cleanup: true
+        networks:
+          - name: "{{ app_network }}"
+        volumes:
+          - "{{ app_data_dir }}/config.yaml:/etc/audit-svc/config.yaml:ro"
+        env:
+          AUDIT_SVC_CONFIG: /etc/audit-svc/config.yaml
+
+    - name: Run audit-svc container
+      community.docker.docker_container:
+        name: audit-svc
+        image: "{{ app_image }}"
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ app_network }}"
+        volumes:
+          - "{{ app_data_dir }}/config.yaml:/etc/audit-svc/config.yaml:ro"
+        env:
+          AUDIT_SVC_CONFIG: /etc/audit-svc/config.yaml
+
+    - name: Render Nginx configuration
+      ansible.builtin.template:
+        src: templates/nginx.conf.j2
+        dest: "{{ app_data_dir }}/nginx/nginx.conf"
+        mode: '0644'
+      notify: Reload nginx
+
+    - name: Run Nginx container
+      community.docker.docker_container:
+        name: nginx
+        image: nginx:alpine
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ app_network }}"
+        volumes:
+          - "{{ app_data_dir }}/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+        ports:
+          - "8088:8088"
+
+    - name: Run nginx-prometheus-exporter
+      community.docker.docker_container:
+        name: nginx-exporter
+        image: nginx/nginx-prometheus-exporter:1.4
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ app_network }}"
+        command:
+          - -nginx.scrape-uri=http://nginx:8089/stub_status
+        ports:
+          - "9113:9113"
+
+  handlers:
+    - name: Reload audit-svc
+      community.docker.docker_container_exec:
+        container: audit-svc
+        command: curl -s -X POST http://localhost:8080/reload
+
+    - name: Reload nginx
+      community.docker.docker_container_exec:
+        container: nginx
+        command: nginx -s reload
