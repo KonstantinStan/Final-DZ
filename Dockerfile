@@ -1,44 +1,35 @@
+# Stage 1: Builder
 FROM python:3.12-slim AS builder
 
+ENV POETRY_VERSION=1.8.3 \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
+    POETRY_NO_INTERACTION=1
+
+RUN pip install --no-cache-dir "poetry==$POETRY_VERSION"
+
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir poetry==1.8.3
-
 COPY pyproject.toml poetry.lock ./
-RUN poetry config virtualenvs.in-project true && \
-    poetry install --no-root --no-interaction --no-ansi --only main
+RUN poetry install --only main --no-root
 
 COPY src/ ./src/
-RUN poetry install --no-interaction --no-ansi --only main
+RUN poetry install --only main
 
+# Stage 2: Runtime
 FROM python:3.12-slim AS runtime
+
+RUN groupadd -r appgroup && useradd -r -g appgroup -d /app -s /sbin/nologin appuser
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd -g 1000 appuser && \
-    useradd -u 1000 -g appuser -s /bin/false -m appuser
-
-COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
-COPY --from=builder --chown=appuser:appuser /app/src /app/src
-COPY --from=builder --chown=appuser:appuser /app/pyproject.toml /app/
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/src /app/src
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONPATH="/app/src" \
+    PYTHONUNBUFFERED=1
 
 USER appuser
 
 EXPOSE 8080
 
-ENTRYPOINT ["python", "-m", "audit_svc"]
-CMD ["run"]
+CMD ["python", "-m", "audit_svc"]

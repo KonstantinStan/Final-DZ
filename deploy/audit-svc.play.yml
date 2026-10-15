@@ -46,11 +46,11 @@
       retries: 25
       delay: 2
 
-    - name: Create audit_svc user if not exists
+    - name: Ensure audit_svc user exists and password is up to date
       community.docker.docker_container_exec:
         container: postgres
         command: >
-          sh -c "psql -U postgres -tc \"SELECT 1 FROM pg_roles WHERE rolname='audit_svc'\" | grep -q 1 || psql -U postgres -c \"CREATE USER audit_svc WITH PASSWORD '{{ vault_audit_svc_password }}';\""
+          sh -c "psql -U postgres -tc \"SELECT 1 FROM pg_roles WHERE rolname='audit_svc'\" | grep -q 1 && psql -U postgres -c \"ALTER USER audit_svc WITH PASSWORD '{{ vault_audit_svc_password }}';\" || psql -U postgres -c \"CREATE USER audit_svc WITH PASSWORD '{{ vault_audit_svc_password }}';\""
 
     - name: Create audit_svc database if not exists
       community.docker.docker_container_exec:
@@ -58,30 +58,36 @@
         command: >
           sh -c "psql -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname='audit_svc'\" | grep -q 1 || (psql -U postgres -c \"CREATE DATABASE audit_svc OWNER audit_svc;\" && psql -U postgres -c \"GRANT ALL PRIVILEGES ON DATABASE audit_svc TO audit_svc;\")"
 
+    - name: Render audit-svc config
+      ansible.builtin.template:
+        src: templates/config.yaml.j2
+        dest: "{{ app_dir }}/config.yaml"
+        mode: '0644'
+      register: svc_config
+
     - name: Run database migrations
       community.docker.docker_container:
         name: audit-svc-migrate
         image: "{{ app_image }}"
+        pull: true
         state: started
         detach: false
         cleanup: true
         networks:
           - name: audit-net
+        volumes:
+          - "{{ app_dir }}/config.yaml:/app/config.yaml:ro"
         env:
+          CONFIG_PATH: "/app/config.yaml"
           DATABASE_URL: "postgresql://audit_svc:{{ vault_audit_svc_password }}@postgres:5432/audit_svc"
+          PYTHONPATH: "/app/src"
         command: "python -m audit_svc.migrate"
-
-    - name: Render audit-svc config
-      ansible.builtin.template:
-        src: templates/config.yaml.j2
-        dest: "{{ app_dir }}/config.yaml"
-        mode: '0600'
-      register: svc_config
 
     - name: Run audit-svc container
       community.docker.docker_container:
         name: audit-svc
         image: "{{ app_image }}"
+        pull: true
         state: started
         restart_policy: always
         networks:
@@ -90,14 +96,15 @@
           - "{{ app_dir }}/config.yaml:/app/config.yaml:ro"
         env:
           CONFIG_PATH: "/app/config.yaml"
+          PYTHONPATH: "/app/src"
+      register: audit_svc_container
 
     - name: Reload audit-svc config if template changed
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:8080/reload"
-        method: POST
-        status_code: 200
-      when: svc_config.changed and not audit_svc_container.changed | default(false)
-      ignore_errors: true
+      community.docker.docker_container_exec:
+        container: audit-svc
+        command: >
+          python -c "import urllib.request; req = urllib.request.Request('http://127.0.0.1:8080/reload', method='POST'); urllib.request.urlopen(req)"
+      when: svc_config.changed and not audit_svc_container.changed
 
     - name: Render nginx config
       ansible.builtin.template:
@@ -118,12 +125,13 @@
           - "8088:8088"
         volumes:
           - "{{ app_dir }}/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+      register: nginx_container
 
     - name: Reload Nginx if config changed
       community.docker.docker_container_exec:
         container: nginx
         command: nginx -s reload
-      when: nginx_config.changed
+      when: nginx_config.changed and not nginx_container.changed
 
     - name: Run nginx-prometheus-exporter
       community.docker.docker_container:
