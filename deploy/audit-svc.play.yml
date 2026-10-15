@@ -21,6 +21,7 @@
       loop:
         - "{{ app_dir }}"
         - "{{ app_dir }}/nginx"
+        - "/etc/audit-svc"
 
     - name: Run PostgreSQL container
       community.docker.docker_container:
@@ -61,7 +62,7 @@
     - name: Render audit-svc config
       ansible.builtin.template:
         src: templates/config.yaml.j2
-        dest: "{{ app_dir }}/config.yaml"
+        dest: "/etc/audit-svc/config.yaml"
         mode: '0644'
       register: svc_config
 
@@ -76,9 +77,8 @@
         networks:
           - name: audit-net
         volumes:
-          - "{{ app_dir }}/config.yaml:/app/config.yaml:ro"
+          - "/etc/audit-svc/config.yaml:/etc/audit-svc/config.yaml:ro"
         env:
-          CONFIG_PATH: "/app/config.yaml"
           DATABASE_URL: "postgresql://audit_svc:{{ vault_audit_svc_password }}@postgres:5432/audit_svc"
           PYTHONPATH: "/app/src"
         command: "python -m audit_svc.migrate"
@@ -87,15 +87,13 @@
       community.docker.docker_container:
         name: audit-svc
         image: "{{ app_image }}"
-        pull: true
         state: started
         restart_policy: always
         networks:
           - name: audit-net
         volumes:
-          - "{{ app_dir }}/config.yaml:/app/config.yaml:ro"
+          - "/etc/audit-svc/config.yaml:/etc/audit-svc/config.yaml:ro"
         env:
-          CONFIG_PATH: "/app/config.yaml"
           PYTHONPATH: "/app/src"
       register: audit_svc_container
 
@@ -144,4 +142,4 @@
         ports:
           - "9113:9113"
         command:
-          - -nginx.scrape-uri=http://nginx:8088/stub_status
+          - -nginx.scrape-uri=http://nginx:8089/stub_status
